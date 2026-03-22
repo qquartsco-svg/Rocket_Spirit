@@ -355,30 +355,206 @@ python -m pytest tests/ -v
 
 ## 현재 모델 범위
 
-이 스택이 현재 다루지 않는 영역:
+v0.1.0이 다루는 영역과 다루지 않는 영역:
 
-| 미포함 영역 | 현재 모델 범위 |
-|-------------|----------------|
-| 연소 불안정·추력 편차 | 결정론적 모델 — 확률적 노이즈 없음 |
-| 지구 자전·코리올리 | 3D 질점 병진 (강체 6-DoF 아님) |
-| 실측 Cd 데이터 | 근사 조각선형 곡선 (CFD·풍동 외) |
-| 정밀 IIP 계산 | 탄도 추정 (대기 재진입·파편 제외) |
-| LES (유인 탈출 시스템) | 무인 발사체 기준 설계 |
-| 86 km 이상 대기 | 표준 대기 상한 → 경계값 유지 |
+| 영역 | 현재 상태 | 다음 확장 경로 |
+|------|-----------|----------------|
+| 대기 모델 | US Std Atm 1976, 0~86 km | NRLMSISE-00 확장, 풍속 프로파일 주입 |
+| 추진 모델 | 결정론적 — 추력 편차 없음 | 엔진 아웃 시뮬레이션, 확률적 노이즈 |
+| 공력 모델 | 근사 Cd(M) 조각선형 | 받음각 의존 모델, 실측 Cd 테이블 교체 |
+| 동역학 | 3D 질점 병진 + 질량 소모 | 강체 6-DoF (자세 동역학 추가) |
+| IIP 계산 | 탄도 근사 추정 | 몬테카를로 IIP 분포 |
+| 지구 모델 | 구형 지구, 자전 없음 | 지구 자전·코리올리 보정 |
+| 대기 상한 | 86 km 경계값 유지 | 86 km 이상 → Lucifer_Engine 전달 |
+| 탈출 시스템 | 무인 발사체 기준 | LES (유인 발사체 확장 시) |
 
-이 범위는 로드맵을 따라 단계적으로 확장된다.
+---
+
+## 레이어별 확장 경로
+
+각 레이어가 어떻게 성장할 수 있는지, 코드 진입점과 함께 기술한다.
+
+### Layer 0 — 데이터 계약 (`contracts/schemas.py`)
+
+현재 계약이 커버하는 것: `RocketState`, `AtmosphereState`, `PropulsionState`,
+`AeroState`, `StageConfig`, `VehicleConfig`, `TelemetryFrame`
+
+확장 시 추가될 계약:
+```python
+# 바람 프로파일 주입
+@dataclass(frozen=True)
+class WindState:
+    altitude_m: float
+    wind_east_ms: float   # 동방향 풍속
+    wind_north_ms: float  # 북방향 풍속
+
+# 엔진 고장 상태
+@dataclass(frozen=True)
+class EngineFailureState:
+    failed_engine_ids: tuple
+    thrust_fraction_remaining: float
+    t_failure_s: float
+
+# 6-DoF 자세 확장
+# RocketState에 angular_velocity, inertia_tensor 추가
+```
+
+### Layer 1 — 물리 엔진 (`physics/`)
+
+**대기 (`atmosphere.py`)**
+- 현재: 7레이어 온도·압력·밀도 함수
+- 다음: `WindProfile` 주입 인터페이스 추가 → `query(h, speed, wind=None)`
+- 장기: NRLMSISE-00 연동 (86 km 이상 전리층까지)
+
+**추진 (`propulsion.py`)**
+- 현재: 결정론적 throttle → thrust
+- 다음: `engine_out_mask` 파라미터 → 엔진별 추력 계산
+- 장기: 추력 편차 σ 주입 → 몬테카를로 시뮬레이션 루프
+
+**공력 (`aero.py`)**
+- 현재: Cd(M) 조각선형 보간
+- 다음: `VehicleAeroConfig.cd_table`에 실측/CFD 데이터 교체 (인터페이스 동일)
+- 장기: 받음각(AoA) 의존 Cd(M, α) 2D 테이블
+
+**적분기 (`integrator.py`)**
+- 현재: 7-state [x,y,z,vx,vy,vz,m] RK4
+- 다음: 13-state [x,y,z,vx,vy,vz,m, q0,q1,q2,q3, ωx,ωy,ωz] → 강체 6-DoF
+- 진입점: `VariableMassIntegrator.step()` 시그니처 유지, 내부 `_deriv()` 확장
+
+### Layer 2 — 비행 단계 관리 (`flight/`)
+
+**FSM (`phase_fsm.py`)**
+- 현재: 11단계 (HOLD → NOMINAL / ABORT)
+- 재사용 발사체 확장 시 추가 단계:
+```
+MECO → BOOSTBACK_BURN → ENTRY_BURN → LANDING_BURN → LANDED
+```
+- 진입점: `FlightPhase` enum 확장 + `FlightPhaseFSM.update()` 전이 조건 추가
+
+**단분리 (`staging.py`)**
+- 현재: 직렬 단분리, 1회 페어링 사출
+- 다음: 핫 스테이징(Hot Staging) — 2단 점화 후 1단 사출 순서 변경
+- 장기: 병렬 스테이지(코어 + 부스터) 지원
+
+### Layer 3 — 유도·제어 (`guidance/`)
+
+**Gravity Turn (`gravity_turn.py`)**
+- 현재: 3단계 오픈 루프 피치 프로그램
+- 다음: **PEG (Powered Explicit Guidance)** — 목표 궤도 요소로 닫힌 루프 유도
+  - 진입점: `FlightCommand` 계약은 동일, `GravityTurnGuidance` 교체 또는 병행
+- 장기: 최적 제어 (연료 최소화 trajectory)
+
+**TVC (`tvc.py`)**
+- 현재: PD 제어기, 짐벌 ±8°
+- 다음: LQR (선형 2차 조절기) 교체 — `TVCConfig`에 Q/R 행렬 파라미터 추가
+- 장기: MPC (모델 예측 제어) — 짐벌 포화·추력 제한 명시적 처리
+
+**귀환 유도 (신규, v0.4.0)**
+```python
+# guidance/powered_descent.py — 귀환 연소·착지 유도
+class PoweredDescentGuidance:
+    def tick(self, state, target_landing_pos) -> FlightCommand: ...
+```
+
+### Layer 4 — 임무 안전 (`safety/`, `audit/`)
+
+**Range Safety (`range_safety.py`)**
+- 현재: 결정론적 탄도 IIP 단일 추정
+- 다음: IIP 몬테카를로 — N회 샘플 → IIP 분포 → 복도 위반 확률
+- 장기: 대기 항력·풍속 포함 재진입 궤적 IIP
+
+**FlightChain (`audit/flight_chain.py`)**
+- 현재: Python 수준 SHA-256 연결 해시, JSON 내보내기
+- 다음: 실시간 텔레메트리 스트림 포맷 (CCSDS 패킷 구조 근사)
+- 장기: 외부 검증 노드 — SYD_DRIFT 분산 감사 체인 연동
+
+### LaunchAgent — 오케스트레이터 (`launch_agent.py`)
+
+**몬테카를로 확장 (v0.3.0 이후)**
+```python
+# 추력 편차 σ를 주입한 N회 시뮬레이션
+from launch_vehicle.launch_agent import MonteCarloBatch
+
+batch = MonteCarloBatch(vehicle, n_runs=1000)
+results = batch.run(thrust_sigma=0.02, wind_sigma=5.0)
+print(results.orbit_insertion_probability)
+```
+
+**실시간 시각화 훅 (선택 연동)**
+```python
+# 매 tick마다 텔레메트리를 외부 뷰어로 스트림
+agent = LaunchAgent(vehicle, on_tick=my_visualizer.update)
+```
 
 ---
 
 ## 확장 로드맵
 
 ```
-v0.1.0 ✅  현재 — 5레이어 기반 구조, 2단 상승 비행 시뮬레이션
-v0.2.0     궤도 삽입 후 Lucifer_Engine 연동 (N-body 전파)
-v0.3.0     닫힌 루프 유도 (PEG 계열, 최적 제어)
-v0.4.0     재사용 발사체 — 귀환 연소·착지 제어
-v0.5.0     다중 발사체 시나리오 (성좌 배치 시뮬레이션)
+v0.1.0 ✅  현재
+           5레이어 기반 구조
+           2단 상승 비행 시뮬레이션 (HOLD → NOMINAL/ABORT)
+           SHA-256 FlightChain 감사
+           112 테스트
+
+v0.2.0     궤도 전파 연동
+           Lucifer_Engine → MECO 이후 N-body 궤도 요소 전달
+           궤도 삽입 정밀도 관측 (Δv 잔량, 이심률 수렴)
+
+v0.3.0     닫힌 루프 유도
+           PEG (Powered Explicit Guidance) 구현
+           몬테카를로 분산 분석 (추력·바람·질량 불확도)
+
+v0.4.0     재사용 발사체
+           1단 귀환 연소 (Boostback → Entry → Landing Burn)
+           PoweredDescentGuidance + LANDED FSM 단계
+           착지 제어 (속도·자세 수렴)
+
+v0.5.0     다중 발사체
+           성좌 배치 시뮬레이션 (N개 동시 발사)
+           발사 창 최적화 (RAAN 정렬)
+           자원 경쟁·충돌 회피 관측
+
+(미래)     6-DoF 강체 동역학
+           자세 동역학 추가 (관성 텐서, 짐벌 포화 정밀 모델)
+           바람·대기 교란 주입
+           유인 탈출 시스템 (LES) 확장
 ```
+
+---
+
+## 기여 진입점
+
+새로운 기능을 추가할 때 어디서 시작하면 좋은지:
+
+```
+물리 모델을 바꾸고 싶다면
+  → physics/ 내 각 엔진 교체 (인터페이스: AtmosphereEngine.query, PropulsionEngine.tick 등)
+  → Config 파라미터 추가 후 schemas.py 계약 업데이트
+
+비행 단계를 추가하고 싶다면
+  → flight/phase_fsm.py — FlightPhase enum + 전이 조건
+  → launch_agent.py — 새 단계 핸들러 추가
+
+유도 알고리즘을 교체하고 싶다면
+  → guidance/ 신규 파일 추가 (FlightCommand 계약 준수)
+  → LaunchAgent.__init__에서 교체 주입
+
+안전 로직을 강화하고 싶다면
+  → safety/range_safety.py — IIP 계산 교체 (RangeSafetyReport 계약 유지)
+  → safety/abort_system.py — 트리거 조건 추가
+
+감사 체인을 확장하고 싶다면
+  → audit/flight_chain.py — FlightBlock 구조 유지, export 형식 추가
+
+새 연동 엔진을 붙이고 싶다면
+  → launch_agent.py 최하단 try/except ImportError 블록에 추가
+  → 없어도 작동하는 선택적 연결 유지
+```
+
+> 모든 상태 객체는 불변(`frozen=True`)이며,
+> 새 엔진은 기존 `*Config` / `*State` 계약을 따라 설계하면
+> LaunchAgent의 10단계 파이프라인에 자연스럽게 편입된다.
 
 ---
 
