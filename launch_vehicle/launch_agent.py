@@ -274,6 +274,19 @@ class LaunchAgent:
         )
 
         # ── 6. 비행 단계 전이 판정 ────────────────────────────────────────
+        # 자동 근지점 번 트리거: COAST 단계에서 vz < 0 (정점 통과 후 하강)
+        # + 최소 궤도 고도 (80km) 확보 — 대기 저항 무시 가능 구간.
+        _apogee_kick = (
+            self._fsm.phase == FlightPhase.COAST
+            and new_state.vz_ms < 0.0
+            and new_state.altitude_m >= 80_000.0
+        )
+        # 궤도 삽입 완료: 저궤도 기준 탄도 속도 도달(≥7 km/s) 또는 추진제 고갈.
+        _orbit_complete = (
+            self._fsm.phase == FlightPhase.ORBIT_INSERT
+            and (new_state.speed_ms >= 7_000.0 or prop.propellant_mass_kg <= 0.0)
+        )
+
         fctx = FlightContext(
             t_s=new_state.t_s,
             altitude_m=new_state.altitude_m,
@@ -284,6 +297,8 @@ class LaunchAgent:
             meco_command=(not prop.is_ignited and
                           self._fsm.phase in (FlightPhase.ASCENDING, FlightPhase.MAX_Q,
                                               FlightPhase.UPPER_BURN)),
+            apogee_kick=_apogee_kick,
+            orbit_complete=_orbit_complete,
         )
         prev_phase = self._fsm.phase
         self._fsm.update(fctx)
@@ -400,7 +415,6 @@ class LaunchAgent:
 
         # Ω_propulsion: 추진제 잔량
         prop_frac = self._prop_eng.propellant_fraction
-        ω_p = max(0.1, prop_frac)
 
         # Ω_structural: 동압 안전 마진
         q_limit = 80_000.0
@@ -417,28 +431,42 @@ class LaunchAgent:
         # Ω_trajectory: 단순화 (속도 존재 여부)
         ω_t = 1.0 if state.speed_ms >= 0 else 0.5
 
+        # Ω_propulsion: 연소 중 추진제 자연 감소는 정상 동작 (비상 아님).
+        # 엔진 점화 중 → 잔량이 0이 아닌 한 ω_p = 1.0.
+        # 비연소 (coast/MECO) → 잔량 비율 기준, 단 최소 0.30 보장 (MECO 순간 ABORT 방지).
+        is_ignited = self._prop_eng.is_ignited
+        if is_ignited:
+            ω_p = 1.0 if prop_frac > 0.0 else 0.30
+        else:
+            ω_p = max(0.30, prop_frac)
+
         # Ω_range: Range Safety
-        ω_r = 1.0 if rss.corridor_ok and rss.iip_safe else 0.20
+        # ⚠️ 설계 결정: corridor 이탈만으로 판정. iip_safe 는 정보용 (자폭 트리거 제외).
+        # 수직 상승 구간 IIP 는 항상 발사장 근처 → iip_safe=False 가 정상 상태.
+        ω_r = 1.0 if rss.corridor_ok else 0.20
         if not rss.corridor_ok:
             alerts.append(f"[위험] 비행복도 이탈")
 
-        # Ω_aero: Air Jordan 저고도 공력 보조 (선택적)
+        # Ω_aero: Air Jordan 저고도 공력 보조 (선택적, 고도 500m 이상만 활성화)
+        # 이유: 이륙 직후(h < 500m) lift_ratio ≈ 0 → 공력 미발달 구간이 정상이므로
+        #       낮은 lift_ratio 가 오경보를 발생시키지 않도록 고도 임계 적용.
         ω_aero = 1.0
-        aj = optional_air_jordan_aero(
-            altitude_m=state.altitude_m,
-            speed_ms=state.speed_ms,
-            mach=state.mach,
-            mass_kg=state.total_mass_kg,
-        )
-        if aj is not None:
-            _hm, _ld, aj_ev = aj
-            evidence.update(aj_ev)
-            # lift_ratio < 0.8 → 공력 이상 경고
-            lr = aj_ev.get("aj_lift_ratio", 1.0)
-            if lr < 0.5:
-                ω_aero = 0.60
-                alerts.append(f"[주의] Air Jordan 양력비 낮음: {lr:.2f}")
-            self._air_jordan_evidence = aj_ev
+        if state.altitude_m > 500.0:
+            aj = optional_air_jordan_aero(
+                altitude_m=state.altitude_m,
+                speed_ms=state.speed_ms,
+                mach=state.mach,
+                mass_kg=state.total_mass_kg,
+            )
+            if aj is not None:
+                _hm, _ld, aj_ev = aj
+                evidence.update(aj_ev)
+                # lift_ratio < 0.5 → 공력 이상 경고
+                lr = aj_ev.get("aj_lift_ratio", 1.0)
+                if lr < 0.5:
+                    ω_aero = 0.60
+                    alerts.append(f"[주의] Air Jordan 양력비 낮음: {lr:.2f}")
+                self._air_jordan_evidence = aj_ev
 
         omega = ω_p * ω_s * ω_t * ω_r * ω_aero
 

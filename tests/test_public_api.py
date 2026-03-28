@@ -12,7 +12,7 @@ from launch_vehicle import (
 def test_root_exports_core_types():
     assert LaunchAgent is not None
     assert FlightPhase.HOLD.value == "hold"
-    assert __version__ == "0.1.1"
+    assert __version__ == "0.1.2"
 
 
 def test_root_exports_support_simple_construction():

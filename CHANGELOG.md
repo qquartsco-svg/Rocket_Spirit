@@ -5,6 +5,53 @@
 
 ---
 
+## [0.1.2] 2026-03-28
+
+### 버그 수정 (시뮬레이션 완주 불가 5개 이슈)
+
+#### Fix 1 — Range Safety: `iip_safe` 가 자폭 트리거를 오발동 (Critical)
+- **원인**: 수직 상승 구간(T+0~MECO) 탄도 IIP 는 항상 발사장 근처 → `iip_safe=False` 가 정상 상태인데, `destruct = not corridor_ok or not iip_safe` 로직이 매 틱 자폭 명령을 생성
+- **수정**: `destruct = not corridor_ok` 로 변경. `iip_safe` 는 정보용 플래그로만 유지
+- 파일: `launch_vehicle/safety/range_safety.py`
+
+#### Fix 2 — LaunchAgent: `ω_r` 계산에서 `iip_safe` 제거 + Air Jordan 고도 가드 (Critical)
+- **원인**: `ω_r = 1.0 if rss.corridor_ok and rss.iip_safe else 0.20` → `iip_safe=False` 시 Ω_r=0.20 → Ω<0.25 → 전체 ABORT
+- **수정**: `ω_r = 1.0 if rss.corridor_ok else 0.20`
+- 추가: Air Jordan 공력 보조를 `altitude_m > 500m` 이상에서만 활성화 (이륙 직후 오경보 방지)
+- 파일: `launch_vehicle/launch_agent.py`
+
+#### Fix 3 — LaunchAgent: `Ω_propulsion` 연소 중 자연 추진제 감소를 비상으로 오판 (Critical)
+- **원인**: `ω_p = max(0.1, prop_frac)` → 75% 추진제 소모 시 `ω_p=0.247<0.25` → Ω<0.25 → ABORT
+- **수정**: 엔진 점화 중이면 `ω_p = 1.0`(잔량 > 0) / 비연소 시 `ω_p = max(0.30, prop_frac)` (MECO 순간 ABORT 방지)
+- 파일: `launch_vehicle/launch_agent.py`
+
+#### Fix 4 — FlightPhaseFSM: MAX_Q ↔ ASCENDING 위상 진동 (Major)
+- **원인**: 동압 감소 시 MAX_Q → ASCENDING 전이 후 여전히 q > 임계 → 즉시 재진입 반복
+- **수정**: `_max_q_complete: bool` 플래그 추가 — 한 번 통과한 MAX_Q 구간 재진입 차단
+- 파일: `launch_vehicle/flight/phase_fsm.py`
+
+#### Fix 5 — Range Safety: `max_downrange_m` 기본값이 LEO 사거리에 비해 과소 (Critical)
+- **원인**: `max_downrange_m=500km` → 궤도 발사 로켓 IIP 가 500km 초과 시 corridor_ok=False → ABORT
+- **수정**: `max_downrange_m=10,000km` (LEO 궤도삽입 전 단계까지 포괄)
+- 파일: `launch_vehicle/safety/range_safety.py`
+
+#### Fix 6 — LaunchAgent: apogee_kick / orbit_complete 미설정으로 COAST → NOMINAL 불가 (Major)
+- **원인**: `FlightContext(apogee_kick=False, orbit_complete=False)` 고정 → COAST 에서 NOMINAL 도달 불가
+- **수정**: 자동 트리거 로직 추가
+  - `apogee_kick = (phase==COAST and vz<0 and alt>=80km)` (정점 통과 자동 감지)
+  - `orbit_complete = (phase==ORBIT_INSERT and (v>=7km/s or prop==0))` (궤도 속도 또는 추진제 고갈)
+- 파일: `launch_vehicle/launch_agent.py`
+
+### 테스트 추가
+- `TestLaunchAgent::test_full_simulation_reaches_nominal` — 2단 로켓 전체 시뮬레이션 회귀 테스트 (HOLD→NOMINAL, ABORT 없음 검증)
+
+### 결과
+- 이전: 시뮬레이션 T+29s에서 무조건 ABORT (Range Safety 오발동)
+- 이후: HOLD→LIFTOFF→ASCENDING→MAX_Q→MECO→STAGE_SEP→UPPER_BURN→COAST→ORBIT_INSERT→NOMINAL 전 단계 완주
+- 테스트: **146 passed** (신규 1개 포함)
+
+---
+
 ## [0.1.1] 2026-03-28
 
 ### 추가

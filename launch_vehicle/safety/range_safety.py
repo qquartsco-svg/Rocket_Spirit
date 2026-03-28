@@ -37,15 +37,21 @@ from ..contracts.schemas import PhysicsConfig, RocketState, DEFAULT_PHYSICS
 class RangeSafetyConfig:
     """비행 복도 파라미터.
 
-    corridor_half_width_m: 비행 경로 중심선에서 최대 허용 이탈 거리 (m)
+    corridor_half_width_m:  비행 경로 중심선에서 최대 허용 이탈 거리 (m)
     corridor_direction_rad: 비행 방위각 (rad, 북=0, 동=π/2)
     max_downrange_m:        최대 허용 사거리 (m)
-    iip_exclusion_radius_m: IIP 금지 구역 반경 (m, 발사장 주변)
+    iip_exclusion_radius_m: 발사장 즉각 보호 구역 반경 (m) — 정보용 전용.
+                            실제 destruct_required 는 corridor_ok 만으로 결정.
+                            (수직 상승 구간에서 IIP 는 항상 발사장 근처 → 200km 는 비현실적)
     """
-    corridor_half_width_m:  float = 50_000.0    # ±50 km 복도
-    corridor_direction_rad: float = 0.0          # 북방향 발사 (참고값)
-    max_downrange_m:        float = 500_000.0    # 500 km 최대 사거리
-    iip_exclusion_radius_m: float = 200_000.0   # IIP 금지 구역 반경
+    corridor_half_width_m:  float = 50_000.0      # ±50 km 복도
+    corridor_direction_rad: float = 0.0            # 동방향 발사 (yaw=0 기본값과 일치)
+    max_downrange_m:        float = 10_000_000.0  # 10,000 km 최대 사거리
+    # 이유: 궤도 발사 로켓은 1단 분리 이후 IIP 가 수천 km 이상 이동하는 것이 정상.
+    # LEO 삽입 시점(~7.8 km/s) 직전 IIP 는 사실상 지구 반바퀴(~20,000 km) 거리.
+    # 실 Range Safety 는 지리 기반 금지 구역(Exclusion Zone) 체크로 구현하며
+    # 단순 거리 상한 10,000 km 은 궤도 삽입 전 단계까지의 발사 복도를 포괄.
+    iip_exclusion_radius_m: float = 5_000.0       # 발사장 즉각 보호 반경 5km (정보용)
 
 
 @dataclass
@@ -103,15 +109,24 @@ class RangeSafetySystem:
             iip_cross <= self._cfg.corridor_half_width_m
             and iip_along <= self._cfg.max_downrange_m
         )
+        # iip_safe: 발사장 즉각 보호 구역 밖 여부 — 정보용 전용.
+        # 수직 상승 초기에는 IIP 가 발사장 근처인 것이 물리적으로 정상이며,
+        # 이를 destruct 조건에 포함하면 모든 발사가 조기 중단된다.
+        # destruct 는 오직 비행복도(corridor_ok) 이탈만으로 판정한다.
         iip_safe = iip_dr >= self._cfg.iip_exclusion_radius_m
 
-        destruct = not corridor_ok or not iip_safe
+        # ⚠️  핵심 설계 결정:
+        # destruct_required = corridor 이탈만으로 판정.
+        # iip_safe 는 참고 정보이며 자폭 트리거에서 제외.
+        # 이유: 수직 상승 구간(T+0~MECO)에서 탄도 IIP 는 항상 발사장
+        # 반경 내에 있으므로 iip_safe=False 가 정상 상태이다.
+        destruct = not corridor_ok
 
         notes = []
         if not corridor_ok:
-            notes.append(f"이탈: crossrange={iip_cross/1000:.1f}km")
+            notes.append(f"복도이탈: crossrange={iip_cross/1000:.1f}km")
         if not iip_safe:
-            notes.append(f"IIP 금지구역: {iip_dr/1000:.1f}km")
+            notes.append(f"IIP 발사장근접(정보): {iip_dr/1000:.1f}km")
 
         return RangeSafetyReport(
             in_corridor=corridor_ok,

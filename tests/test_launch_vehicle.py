@@ -970,3 +970,49 @@ class TestLaunchAgent:
         event = self.agent._staging.separate(t_s=160.0)
         assert event is not None
         assert self.agent._staging.stage_idx == 1
+
+    def test_full_simulation_reaches_nominal(self):
+        """2단 로켓 전체 시뮬레이션: HOLD → NOMINAL (ABORT 없음).
+
+        회귀 테스트:
+          - Ω_propulsion 오판(연소 중 자연 추진제 감소 → ABORT 오트리거) 방지
+          - Range Safety 오트리거(IIP 복도 이탈 오판) 방지
+          - FSM MAX_Q 위상 진동 방지
+          - apogee_kick / orbit_complete 자동 트리거 검증
+        """
+        from launch_vehicle import StageConfig, VehicleConfig
+        s1 = StageConfig(
+            stage_id=1, dry_mass_kg=25_000, propellant_mass_kg=400_000,
+            engine_count=9, isp_sl_s=282, isp_vac_s=311,
+            thrust_sl_n=7_607_000, thrust_vac_n=8_227_000,
+            nozzle_exit_area_m2=11.5, max_throttle=1.0, min_throttle=0.57,
+            burn_time_design_s=162,
+        )
+        s2 = StageConfig(
+            stage_id=2, dry_mass_kg=4_000, propellant_mass_kg=92_000,
+            engine_count=1, isp_sl_s=340, isp_vac_s=380,
+            thrust_sl_n=934_000, thrust_vac_n=980_000,
+            nozzle_exit_area_m2=3.0, max_throttle=1.0, min_throttle=0.40,
+            burn_time_design_s=375,
+        )
+        vehicle = VehicleConfig(vehicle_id="RST-REG", stages=[s1, s2],
+                                payload_mass_kg=22_800, fairing_mass_kg=1_900,
+                                body_diameter_m=3.66)
+        agent = LaunchAgent(vehicle, dt_s=0.5, chain_interval=50)
+        agent.command_go()
+
+        for _ in range(50_000):
+            frame = agent.tick()
+            if frame.phase in (FlightPhase.NOMINAL, FlightPhase.ABORT):
+                break
+
+        assert frame.phase == FlightPhase.NOMINAL, (
+            f"시뮬레이션이 NOMINAL 에 도달하지 못함: {frame.phase.value} "
+            f"(t={frame.t_s:.1f}s, Ω={frame.health.omega:.3f}, "
+            f"Ω_r={frame.health.omega_range:.3f})"
+        )
+        assert agent.chain.verify_integrity(), "FlightChain 무결성 위반"
+        # 최소 궤도 고도 확보 (100 km+)
+        assert frame.state.altitude_m >= 100_000.0, (
+            f"최종 고도 부족: {frame.state.altitude_m/1000:.1f}km"
+        )

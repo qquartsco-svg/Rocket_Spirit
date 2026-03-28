@@ -88,6 +88,10 @@ class FlightPhaseFSM:
         self._sep_t:   float = -1.0
         self._q_prev:  float = 0.0
         self._in_maxq: bool  = False
+        # Max-Q 구간 완료 플래그: 한 번 통과한 이후 재진입 방지.
+        # 이유: 동압이 고도 상승 후 감소 전환 시 미세 진동으로
+        #       ASCENDING↔MAX_Q 를 반복하는 오진입 현상 제거.
+        self._max_q_complete: bool = False
 
     # ── 공개 API ──────────────────────────────────────────────────────────────
 
@@ -153,8 +157,11 @@ class FlightPhaseFSM:
             self._transition(FlightPhase.ASCENDING, ctx.t_s, "tower_clear")
 
     def _from_ascending(self, ctx: FlightContext) -> None:
-        # Max-Q 진입: 동압이 임계 이상이 되면
-        if ctx.dynamic_q_pa >= self._cfg.q_maxq_threshold_pa and not self._in_maxq:
+        # Max-Q 진입: 동압이 임계 이상 AND 아직 Max-Q 구간 미통과
+        # _max_q_complete=True 이면 재진입 금지 (동압 감소 후 미세 상승 오진입 방지)
+        if (ctx.dynamic_q_pa >= self._cfg.q_maxq_threshold_pa
+                and not self._in_maxq
+                and not self._max_q_complete):
             self._in_maxq = True
             self._transition(FlightPhase.MAX_Q, ctx.t_s, "q_threshold")
         elif ctx.meco_command or ctx.propellant_kg <= 0.0:
@@ -163,8 +170,10 @@ class FlightPhaseFSM:
 
     def _from_maxq(self, ctx: FlightContext) -> None:
         # Max-Q 탈출: 동압이 감소세로 전환되면 다시 ASCENDING
+        # _max_q_complete=True 로 마킹 → 이후 ASCENDING에서 MAX_Q 재진입 차단
         if ctx.dynamic_q_pa < self._q_prev and self._in_maxq:
             self._in_maxq = False
+            self._max_q_complete = True  # Max-Q 구간 완료
             self._transition(FlightPhase.ASCENDING, ctx.t_s, "q_past_peak")
         elif ctx.meco_command or ctx.propellant_kg <= 0.0:
             self._meco_t = ctx.t_s
