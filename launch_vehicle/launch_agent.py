@@ -8,27 +8,41 @@
   Layer 3 (guidance):  GravityTurnGuidance, TVCController
   Layer 4 (safety):    RangeSafetySystem, AbortSystem, FlightChain
 
+에코시스템 브리지 (선택적):
+  TAM (StarScream)  → 호버 readiness 를 발사 사전 인가로 수신
+  Air Jordan        → 저고도(< 20 km) 공력 보조 판정
+  AgedCare_Stack    → 유인 발사(MVP-4) 탑승자 안전 게이트
+
 틱 파이프라인 (매 dt_s):
-  1. 대기 상태 추정 (고도 → AtmosphereEngine)
-  2. 추진 상태 갱신 (스로틀·대기 → PropulsionEngine)
-  3. 공력 계산 (대기·속도 → AerodynamicsEngine)
-  4. 유도·제어 명령 생성 (상태·단계 → GravityTurn + TVC)
-  5. RK4 적분 (추력·항력·질량 → VariableMassIntegrator)
-  6. 비행 단계 전이 판정 (FlightPhaseFSM)
-  7. Range Safety 점검
-  8. 중단 평가
-  9. 건전성 Ω 계산
-  10. 텔레메트리 기록 (FlightChain)
+  1.  대기 상태 추정 (고도 → AtmosphereEngine)
+  2.  유도·제어 명령 생성 (상태·단계 → GravityTurn + TVC)
+  3.  추진 상태 갱신 (스로틀·대기 → PropulsionEngine)
+  4.  공력 계산 (대기·속도 → AerodynamicsEngine)
+  5.  RK4 적분 (추력·항력·질량 → VariableMassIntegrator)
+  6.  비행 단계 전이 판정 (FlightPhaseFSM)
+  7.  단분리 처리 (StagingManager)
+  8.  Range Safety 점검
+  9.  건전성 Ω 계산 [+ Air Jordan 보조]
+  10. 중단 평가
+  11. 텔레메트리 기록 (FlightChain)
 
 설계 원칙:
   - 하나의 tick() 이 하나의 물리적 시간스텝에 대응
   - 상태는 함수적으로 갱신 (RocketState 불변 → 새 객체)
-  - 외부 에서 주입 가능한 모든 엔진 (Edge AI 패턴)
+  - 외부에서 주입 가능한 모든 엔진 (Edge AI 패턴)
+  - 브리지는 ImportError 시 자동 폴백 — 독립 동작 보장
 """
 from __future__ import annotations
 
 import math
-from typing import Optional
+from typing import Any, List, Optional
+
+from .bridges.tam_bridge import TamLaunchReadiness, optional_tam_launch_readiness
+from .bridges.air_jordan_bridge import optional_air_jordan_aero
+from .adapters.aged_care_adapter import (
+    AgedCareLaunchSafety,
+    evaluate_crew_launch_gate,
+)
 
 from .contracts.schemas import (
     FlightCommand, FlightHealth, FlightPhase, PhysicsConfig,
@@ -79,6 +93,10 @@ class LaunchAgent:
         propulsion_config: Optional[PropulsionConfig]   = None,
         chain_interval:  int = 10,    # N틱마다 체인 기록
         physics: PhysicsConfig = DEFAULT_PHYSICS,
+        # ── 에코시스템 브리지 (선택) ─────────────────────────────────────
+        tam_readiness:   Optional[TamLaunchReadiness]   = None,
+        crew_safety:     Optional[AgedCareLaunchSafety] = None,
+        human_rated_mvp4: bool = False,
     ):
         self._vehicle = vehicle
         self._dt_s    = dt_s
@@ -111,6 +129,12 @@ class LaunchAgent:
         self._abort_sys = AbortSystem(abort_config)
         self._chain    = FlightChain(vehicle.vehicle_id, chain_interval)
 
+        # ── 에코시스템 브리지 상태 ────────────────────────────────────────
+        self._tam_readiness   = tam_readiness
+        self._crew_safety     = crew_safety
+        self._human_rated     = human_rated_mvp4
+        self._air_jordan_evidence: dict = {}
+
         # ── 초기 상태 ─────────────────────────────────────────────────────
         self._state = RocketState(
             total_mass_kg=vehicle.total_liftoff_mass_kg,
@@ -121,9 +145,16 @@ class LaunchAgent:
         self._go    = False   # 발사 허가 플래그
 
         # 초기 이벤트 기록
-        self._chain.record_event(0.0, "init",
-                                 {"vehicle": vehicle.vehicle_id,
-                                  "mass_kg": vehicle.total_liftoff_mass_kg})
+        init_ev: dict = {
+            "vehicle":   vehicle.vehicle_id,
+            "mass_kg":   vehicle.total_liftoff_mass_kg,
+            "human_rated": human_rated_mvp4,
+        }
+        if tam_readiness is not None:
+            init_ev["tam_mode"]    = tam_readiness.tam_mode
+            init_ev["tam_omega"]   = tam_readiness.tam_omega_total
+            init_ev["tam_auth"]    = tam_readiness.launch_authorized
+        self._chain.record_event(0.0, "init", init_ev)
 
     # ── 공개 제어 ─────────────────────────────────────────────────────────────
 
@@ -131,6 +162,53 @@ class LaunchAgent:
         """발사 허가 명령 (Go command)."""
         self._go = True
         self._chain.record_event(self._t_s, "go_command", {"t_s": self._t_s})
+
+    def command_go_from_tam(
+        self,
+        report: Any = None,
+        mode: str = "HOVER",
+    ) -> bool:
+        """TAM readiness 기반 발사 인가.
+
+        TAM FlightReadinessReport 가 발사 최소 조건(HOVER, Ω≥0.80, blockers=없음)을
+        만족할 때만 Go 명령을 발행한다.
+
+        Args:
+            report: TAM FlightReadinessReport (또는 duck-typed 동등 객체).
+                    None 이면 기존 self._tam_readiness 를 사용.
+            mode:   현재 TAM 모드 문자열.
+
+        Returns:
+            True = 발사 인가됨, False = 조건 미달 (차단).
+        """
+        if report is not None:
+            self._tam_readiness = optional_tam_launch_readiness(report, mode)
+
+        r = self._tam_readiness
+        if r is None or not r.launch_authorized:
+            reason = "tam_not_authorized" if r else "tam_readiness_missing"
+            self._chain.record_event(self._t_s, "go_from_tam_denied",
+                                     {"reason": reason,
+                                      "tam_omega": r.tam_omega_total if r else 0.0})
+            return False
+
+        # 유인 MVP-4 추가 게이트
+        if self._human_rated:
+            crew_ok, crew_blockers = evaluate_crew_launch_gate(
+                self._crew_safety, self._human_rated
+            )
+            if not crew_ok:
+                self._chain.record_event(self._t_s, "go_from_tam_denied",
+                                         {"reason": "crew_gate_failed",
+                                          "blockers": crew_blockers})
+                return False
+
+        self._go = True
+        self._chain.record_event(self._t_s, "go_from_tam",
+                                 {"tam_mode":  r.tam_mode,
+                                  "tam_omega": r.tam_omega_total,
+                                  "tam_verdict": r.tam_verdict})
+        return True
 
     def command_abort(self) -> None:
         """외부 중단 명령."""
@@ -308,22 +386,24 @@ class LaunchAgent:
         prop,
         rss: RangeSafetyReport,
     ) -> FlightHealth:
-        """Ω_flight = Ω_p × Ω_s × Ω_t × Ω_r.
+        """Ω_rocket = Ω_p × Ω_s × Ω_t × Ω_r [× Ω_aero (저고도, Air Jordan)].
 
-        각 인수:
+        컴포넌트:
           Ω_propulsion:  추진제 잔량 비율
           Ω_structural:  동압 안전 마진
-          Ω_trajectory:  속도/자세 발산 정도 (단순화)
+          Ω_trajectory:  속도/자세 발산 정도
           Ω_range:       Range Safety 상태
+          Ω_aero:        Air Jordan 공력 보조 (저고도만, 없으면 1.0)
         """
-        alerts = []
+        alerts: List[str] = []
+        evidence: dict = {}
 
         # Ω_propulsion: 추진제 잔량
         prop_frac = self._prop_eng.propellant_fraction
-        ω_p = max(0.1, prop_frac)  # 0이면 엔진 꺼진 상태 → 최소값
+        ω_p = max(0.1, prop_frac)
 
         # Ω_structural: 동압 안전 마진
-        q_limit = 80_000.0  # Pa (설정값으로 이동 필요 시 AbortSystemConfig 참고)
+        q_limit = 80_000.0
         q = atm.dynamic_q_pa
         if q > q_limit:
             ω_s = 0.10
@@ -340,9 +420,27 @@ class LaunchAgent:
         # Ω_range: Range Safety
         ω_r = 1.0 if rss.corridor_ok and rss.iip_safe else 0.20
         if not rss.corridor_ok:
-            alerts.append(f"[위험] 비행복도 이탈: {rss.note}")
+            alerts.append(f"[위험] 비행복도 이탈")
 
-        omega = ω_p * ω_s * ω_t * ω_r
+        # Ω_aero: Air Jordan 저고도 공력 보조 (선택적)
+        ω_aero = 1.0
+        aj = optional_air_jordan_aero(
+            altitude_m=state.altitude_m,
+            speed_ms=state.speed_ms,
+            mach=state.mach,
+            mass_kg=state.total_mass_kg,
+        )
+        if aj is not None:
+            _hm, _ld, aj_ev = aj
+            evidence.update(aj_ev)
+            # lift_ratio < 0.8 → 공력 이상 경고
+            lr = aj_ev.get("aj_lift_ratio", 1.0)
+            if lr < 0.5:
+                ω_aero = 0.60
+                alerts.append(f"[주의] Air Jordan 양력비 낮음: {lr:.2f}")
+            self._air_jordan_evidence = aj_ev
+
+        omega = ω_p * ω_s * ω_t * ω_r * ω_aero
 
         if omega >= 0.80:
             verdict = "NOMINAL"
@@ -366,6 +464,14 @@ class LaunchAgent:
 
     # ── 요약 ─────────────────────────────────────────────────────────────────
 
+    @property
+    def tam_readiness(self) -> Optional[TamLaunchReadiness]:
+        return self._tam_readiness
+
+    @property
+    def air_jordan_evidence(self) -> dict:
+        return dict(self._air_jordan_evidence)
+
     def summary(self) -> str:
         s = self._state
         lines = [
@@ -379,4 +485,16 @@ class LaunchAgent:
             f"  사거리:    {s.downrange_m/1000:.3f} km",
             f"  감사블록:  {self._chain.length}개",
         ]
+        if self._tam_readiness is not None:
+            r = self._tam_readiness
+            lines.append(
+                f"  TAM:       {r.tam_mode} | Ω={r.tam_omega_total:.3f} "
+                f"| auth={r.launch_authorized}"
+            )
+        if self._air_jordan_evidence:
+            ev = self._air_jordan_evidence
+            lines.append(
+                f"  Air Jordan: lr={ev.get('aj_lift_ratio', '-'):.2f} "
+                f"| LD={ev.get('aj_ld', '-'):.1f}"
+            )
         return "\n".join(lines)

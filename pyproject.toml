@@ -4,7 +4,7 @@ build-backend = "setuptools.backends.legacy:build"
 
 [project]
 name            = "launch-vehicle-stack"
-version         = "0.1.0"
+version         = "0.1.1"
 description     = "발사체 비행 시뮬레이션 스택 — 대기·추진·유도·안전을 레이어로 분리한 로켓 OS"
 readme          = "README.md"
 license         = {text = "MIT"}
@@ -12,8 +12,9 @@ requires-python = ">=3.9"
 keywords        = ["launch-vehicle", "rocket", "trajectory", "propulsion", "range-safety"]
 
 [project.optional-dependencies]
-lucifer  = ["lucifer-engine"]       # 궤도 전파 (MECO 이후)
+lucifer  = ["lucifer-engine"]             # 궤도 전파 (MECO 이후)
 autonomy = ["autonomy-runtime-stack"]
+full     = ["transformable-air-mobility-stack", "air-jordan"]  # 에코시스템 전체
 dev      = ["pytest>=7.4", "pytest-cov"]
 
 [tool.pytest.ini_options]
