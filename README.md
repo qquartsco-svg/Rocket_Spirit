@@ -14,10 +14,32 @@
 
 `Rocket_Spirit` 는 발사체가 지상을 떠나 궤도에 접근하기까지의 물리적 여정을 레이어로 분리한 비행 시뮬레이션 스택이다.
 
+v0.1.2 부터는 시뮬레이션 완주 버그 6개를 수정하여 전체 비행 시퀀스(HOLD→NOMINAL)가 안정적으로 동작한다.
 v0.1.1 부터는 단독 동작에 더해 전체 에코시스템과 연결된다:
 
 ```
 [휠체어] → WTS 변형 → TAM (StarScream) 호버 판정 → Rocket_Spirit 발사 인가 → 궤도
+```
+
+---
+
+## v0.1.2 — 시뮬레이션 완주 버그 수정
+
+v0.1.1 이전 시뮬레이션은 T+29s에 무조건 ABORT되는 치명적 버그가 있었다.
+v0.1.2에서 6개 이슈를 수정하여 전체 비행 시퀀스가 안정적으로 NOMINAL에 도달한다.
+
+| 수정 | 위치 | 내용 |
+|------|------|------|
+| **Fix 1** | `range_safety.py` | `destruct = not corridor_ok` — `iip_safe` 자폭 트리거 제외 (수직 상승 초기 IIP 는 발사장 근처가 정상) |
+| **Fix 2** | `launch_agent.py` | `ω_r` 에서 `iip_safe` 제거 + Air Jordan 고도 가드 (h > 500m) |
+| **Fix 3** | `launch_agent.py` | `Ω_propulsion` 재설계 — 연소 중 자연 추진제 감소 ≠ 비상 (`is_ignited=True` 이면 `ω_p=1.0`) |
+| **Fix 4** | `phase_fsm.py` | `_max_q_complete` 플래그로 MAX_Q ↔ ASCENDING 위상 진동 차단 |
+| **Fix 5** | `range_safety.py` | `max_downrange_m` 500 km → 10,000 km (LEO 궤도삽입 IIP 범위) |
+| **Fix 6** | `launch_agent.py` | `apogee_kick` / `orbit_complete` 자동 트리거 — COAST → NOMINAL 경로 완성 |
+
+```
+수정 전: HOLD → T+29s ABORT
+수정 후: HOLD → LIFTOFF → ASCENDING → MAX_Q → MECO → STAGE_SEP → UPPER_BURN → COAST → ORBIT_INSERT → NOMINAL (T≈514s)
 ```
 
 ---
@@ -317,7 +339,7 @@ cd LaunchVehicle_Stack
 python -m pytest tests/ -v
 ```
 
-현재 결과: **145 passed**
+현재 결과: **146 passed**
 
 | 섹션 | 내용 |
 |------|------|
@@ -354,7 +376,8 @@ python -m pytest tests/ -v
 
 ## 로드맵
 
-- `v0.1.1`: 현재 — 에코시스템 연결 (TAM, Air Jordan, AgedCare)
+- `v0.1.2`: 현재 — 시뮬레이션 완주 버그 6개 수정 (Range Safety 오발동, Ω_p 오진단, FSM 진동, IIP 복도, apogee_kick 자동화)
+- `v0.1.1`: 에코시스템 연결 (TAM, Air Jordan, AgedCare)
 - `v0.2.0`: `Lucifer_Engine` 궤도 전파 연동 (MECO 이후 궤적)
 - `v0.3.0`: PEG 정밀 유도 + 몬테카를로
 - `v0.4.0`: 재사용 발사체 귀환 (powered descent)

@@ -14,10 +14,32 @@ This stack writes that soul in code. And it keeps being written.
 
 `Rocket_Spirit` is a layered flight simulation stack covering the physical journey from ground to orbit insertion.
 
+From v0.1.2, six simulation-critical bugs have been fixed — the full flight sequence (HOLD→NOMINAL) now completes stably.
 From v0.1.1, it connects to the full ecosystem:
 
 ```
 [Wheelchair] → WTS morphing → TAM (StarScream) hover gate → Rocket_Spirit launch → Orbit
+```
+
+---
+
+## v0.1.2 — Simulation Bug Fixes
+
+Prior to v0.1.2, every simulation aborted at T+29s due to a cascade of six design bugs.
+All have been resolved — the full 11-phase flight sequence now completes stably.
+
+| Fix | File | Description |
+|-----|------|-------------|
+| **1** | `range_safety.py` | `destruct = not corridor_ok` — removed `iip_safe` from destruct trigger (IIP near launch site is normal during vertical ascent) |
+| **2** | `launch_agent.py` | Removed `iip_safe` from `ω_r` calculation + Air Jordan altitude guard (h > 500m) |
+| **3** | `launch_agent.py` | `Ω_propulsion` redesigned — natural propellant depletion during burn ≠ emergency (`is_ignited=True` → `ω_p=1.0`) |
+| **4** | `phase_fsm.py` | `_max_q_complete` flag prevents MAX_Q ↔ ASCENDING phase oscillation |
+| **5** | `range_safety.py` | `max_downrange_m` 500 km → 10,000 km (covers IIP range through LEO insertion) |
+| **6** | `launch_agent.py` | Auto-trigger `apogee_kick` / `orbit_complete` — completes COAST → NOMINAL path |
+
+```
+Before: HOLD → T+29s ABORT
+After:  HOLD → LIFTOFF → ASCENDING → MAX_Q → MECO → STAGE_SEP → UPPER_BURN → COAST → ORBIT_INSERT → NOMINAL (T≈514s)
 ```
 
 ---
@@ -251,7 +273,7 @@ cd LaunchVehicle_Stack
 python -m pytest tests/ -v
 ```
 
-Current: **145 passed**
+Current: **146 passed**
 
 | Section | Coverage |
 |---------|----------|
@@ -273,7 +295,8 @@ Current: **145 passed**
 | Ecosystem | TAM, Air Jordan, AgedCare | Lucifer_Engine orbit |
 
 **Roadmap:**
-- `v0.1.1` — current: ecosystem bridges (TAM, Air Jordan, AgedCare)
+- `v0.1.2` — current: simulation bug fixes ×6 (Range Safety false abort, Ω_p misdiagnosis, FSM oscillation, IIP corridor, apogee_kick automation)
+- `v0.1.1` — ecosystem bridges (TAM, Air Jordan, AgedCare)
 - `v0.2.0` — Lucifer_Engine orbital propagation (post-MECO)
 - `v0.3.0` — PEG guidance + Monte Carlo
 - `v0.4.0` — Reusable vehicle return (powered descent)
