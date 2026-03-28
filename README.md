@@ -378,7 +378,7 @@ python -m pytest tests/ -v
 
 - `v0.1.2`: 현재 — 시뮬레이션 완주 버그 6개 수정 (Range Safety 오발동, Ω_p 오진단, FSM 진동, IIP 복도, apogee_kick 자동화)
 - `v0.1.1`: 에코시스템 연결 (TAM, Air Jordan, AgedCare)
-- `v0.2.0`: `Lucifer_Engine` 궤도 전파 연동 (MECO 이후 궤적)
+- `v0.2.0`: `Lucifer_Engine` 궤도 전파 연동 (MECO 이후 궤적) → [github.com/qquartsco-svg/Lucifer_Engine](https://github.com/qquartsco-svg/Lucifer_Engine)
 - `v0.3.0`: PEG 정밀 유도 + 몬테카를로
 - `v0.4.0`: 재사용 발사체 귀환 (powered descent)
 - `v0.5.0`: 다중 발사체 / 성좌 배치
